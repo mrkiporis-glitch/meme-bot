@@ -1,0 +1,351 @@
+import logging
+import os
+from io import BytesIO
+import base64
+import random
+
+from PIL import Image, ImageDraw, ImageFont
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    filters,
+    ContextTypes
+)
+import requests
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения
+load_dotenv()
+
+# ⚡ ТВОЙ ТОКЕН (вставлен)
+TOKEN = '8289148407:AAEh86Nhaqx0ndtdXj9Y3SWqeZLxTJKhW8M'
+
+# API ключ OpenAI (пока пустой, бот будет использовать случайные подписи)
+AI_API_KEY = os.getenv('AI_API_KEY', '')
+AI_PROVIDER = os.getenv('AI_PROVIDER', 'openai')
+
+# Состояния для ConversationHandler
+UPLOAD_PHOTO = 0
+
+# Временное хранилище
+user_data = {}
+
+# Настройка логирования
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    keyboard = [
+        [InlineKeyboardButton("🤣 Случайный мем", callback_data="random_meme")],
+        [InlineKeyboardButton("🎭 Выбрать стиль юмора", callback_data="choose_style")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        '🤖 Привет! Я бот, который сам придумывает подписи к картинкам!\n\n'
+        'Просто отправь мне любое фото, а я:\n'
+        '1️⃣ Проанализирую что на нём происходит\n'
+        '2️⃣ Придумаю смешную подпись\n'
+        '3️⃣ Наложу текст на картинку\n\n'
+        'Погнали! 🚀',
+        reply_markup=reply_markup
+    )
+    return UPLOAD_PHOTO
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик кнопок"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "random_meme":
+        await query.message.reply_text("Отправь фото, и я сделаю из него мем!")
+    elif query.data == "choose_style":
+        keyboard = [
+            [InlineKeyboardButton("Саркастичный", callback_data="style_sarcastic")],
+            [InlineKeyboardButton("Абсурдный", callback_data="style_absurd")],
+            [InlineKeyboardButton("Черный юмор", callback_data="style_dark")],
+            [InlineKeyboardButton("Кринжовый", callback_data="style_cringe")],
+            [InlineKeyboardButton("Назад", callback_data="back")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.message.edit_text(
+            "Выбери стиль юмора для подписи:",
+            reply_markup=reply_markup
+        )
+    elif query.data.startswith("style_"):
+        style = query.data.replace("style_", "")
+        context.user_data['meme_style'] = style
+        await query.message.edit_text(
+            f"✅ Выбран стиль: {style}\n\nТеперь отправь фото!"
+        )
+    elif query.data == "back":
+        await start(query, context)
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик получения фотографии"""
+    user_id = update.effective_user.id
+    processing_msg = await update.message.reply_text('🔍 Анализирую картинку и придумываю подпись...')
+    
+    try:
+        # Получаем фото
+        photo_file = await update.message.photo[-1].get_file()
+        image_stream = BytesIO()
+        await photo_file.download_to_memory(image_stream)
+        image_stream.seek(0)
+        
+        # Генерируем подпись
+        caption = await generate_meme_caption(image_stream, context.user_data.get('meme_style', 'funny'))
+        
+        await processing_msg.edit_text(f'💬 Придумал подпись: "{caption}"\n\n🖼 Создаю мем...')
+        
+        # Создаем мем
+        image_stream.seek(0)
+        meme_image = await create_meme_from_caption(image_stream, caption)
+        
+        # Отправляем результат
+        await update.message.reply_photo(
+            photo=meme_image,
+            caption=f"🎉 Держи мем!\n\nПодпись: {caption}"
+        )
+        
+        # Кнопки для дальнейших действий
+        keyboard = [
+            [InlineKeyboardButton("🔄 Другая подпись", callback_data="regenerate")],
+            [InlineKeyboardButton("🆕 Новый мем", callback_data="new_meme")],
+            [InlineKeyboardButton("🎭 Сменить стиль", callback_data="choose_style")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Сохраняем фото для регенерации
+        image_stream.seek(0)
+        user_data[user_id] = {'last_image': image_stream}
+        
+        await update.message.reply_text(
+            "Что делаем дальше?",
+            reply_markup=reply_markup
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await processing_msg.edit_text(
+            '❌ Что-то пошло не так. Попробуй другое фото или /start'
+        )
+    finally:
+        await processing_msg.delete()
+
+async def regenerate_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Генерация другой подписи"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    if user_id not in user_data or 'last_image' not in user_data[user_id]:
+        await query.message.reply_text("Сначала отправь фото!")
+        return
+    
+    await query.message.reply_text('🔄 Генерирую другую подпись...')
+    
+    try:
+        # Генерируем новую подпись
+        image_stream = user_data[user_id]['last_image']
+        image_stream.seek(0)
+        
+        new_caption = await generate_meme_caption(
+            image_stream, 
+            context.user_data.get('meme_style', 'funny'),
+            alternative=True
+        )
+        
+        # Создаем новый мем
+        image_stream.seek(0)
+        new_meme = await create_meme_from_caption(image_stream, new_caption)
+        
+        await query.message.reply_photo(
+            photo=new_meme,
+            caption=f"🎉 Альтернативная версия!\n\nПодпись: {new_caption}"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка регенерации: {e}")
+        await query.message.reply_text('❌ Не удалось сгенерировать другую подпись')
+
+async def generate_meme_caption(image_stream, style='funny', alternative=False):
+    """Генерация подписи (сейчас случайные, позже подключишь нейросеть)"""
+    
+    # Пока используем случайные подписи (чтоб бот работал без API ключа)
+    fallback_captions = {
+        'sarcastic': [
+            "О, конечно, это именно то, что я хотел увидеть",
+            "Вау, просто вау... Я впечатлён (нет)",
+            "Гениально! Особенно если ты идиот"
+        ],
+        'absurd': [
+            "Кот в сапогах против Годзиллы",
+            "Когда твой холодильник начал разговаривать",
+            "Понедельник наступил неожиданно"
+        ],
+        'dark': [
+            "Последнее фото перед тем, как...",
+            "Спойлер: они не выжили",
+            "Проктолог: ну и жопа у тебя, пациент"
+        ],
+        'cringe': [
+            "Я ТЕБЯ ЛЮБЛЮ СИЛЬНО ПРИСИЛЬНО",
+            "Танцую как в 2010",
+            "Мама, смотри я в телеке!"
+        ],
+        'funny': [
+            "Лицо после новостей о повышении цен",
+            "Когда пошутил, а никто не засмеялся",
+            "Понял, принял, забил",
+            "Ожидание vs реальность",
+            "Я у мамы инженер нейросетей",
+            "Когда пытаешься выглядеть умным в компании"
+        ]
+    }
+    
+    style_captions = fallback_captions.get(style, fallback_captions['funny'])
+    return random.choice(style_captions)
+
+async def create_meme_from_caption(image_stream, caption):
+    """Создание мема из картинки и подписи"""
+    image = Image.open(image_stream)
+    
+    # Изменяем размер для мема
+    max_size = (800, 800)
+    image.thumbnail(max_size, Image.Resampling.LANCZOS)
+    
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+    
+    # Настраиваем шрифт
+    try:
+        # Пробуем разные шрифты
+        font_options = ['impact.ttf', 'arial.ttf', 'arialbd.ttf', 'DejaVuSans-Bold.ttf']
+        font = None
+        
+        for font_name in font_options:
+            try:
+                font_size = int(height * 0.08)
+                font = ImageFont.truetype(font_name, font_size)
+                break
+            except:
+                continue
+        
+        if font is None:
+            font = ImageFont.load_default()
+            font_size = 30
+    except:
+        font = ImageFont.load_default()
+        font_size = 30
+    
+    # Функция для рисования текста с обводкой
+    def draw_text_with_outline(text, y_position):
+        # Разбиваем длинный текст на строки
+        words = text.split()
+        lines = []
+        current_line = []
+        
+        for word in words:
+            test_line = ' '.join(current_line + [word])
+            if hasattr(font, 'getbbox'):
+                bbox = font.getbbox(test_line)
+                text_width = bbox[2] - bbox[0]
+            else:
+                text_width, _ = draw.textsize(test_line, font=font)
+            
+            if text_width < width * 0.9:
+                current_line.append(word)
+            else:
+                lines.append(' '.join(current_line))
+                current_line = [word]
+        
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        # Рисуем каждую строку
+        line_height = font_size + 5
+        start_y = y_position
+        
+        for i, line in enumerate(lines):
+            line_y = start_y + (i * line_height)
+            
+            if hasattr(font, 'getbbox'):
+                bbox = font.getbbox(line)
+                text_width = bbox[2] - bbox[0]
+            else:
+                text_width, _ = draw.textsize(line, font=font)
+            
+            x = (width - text_width) // 2
+            
+            # Рисуем обводку
+            outline_size = max(2, font_size // 10)
+            for dx in range(-outline_size, outline_size + 1):
+                for dy in range(-outline_size, outline_size + 1):
+                    if dx != 0 or dy != 0:
+                        draw.text((x + dx, line_y + dy), line, font=font, fill='black')
+            
+            draw.text((x, line_y), line, font=font, fill='white')
+    
+    # Добавляем подпись сверху
+    draw_text_with_outline(caption.upper(), height * 0.02)
+    
+    # Сохраняем результат
+    output = BytesIO()
+    image.save(output, format='PNG')
+    output.seek(0)
+    
+    return output
+
+async def new_meme_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начать новый мем"""
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text("Отправь новое фото для создания мема!")
+    return UPLOAD_PHOTO
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отмена операции"""
+    await update.message.reply_text('👋 Пока! Отправь /start, если передумаешь')
+    return ConversationHandler.END
+
+def main():
+    """Запуск бота"""
+    # Создаем приложение
+    application = Application.builder().token(TOKEN).build()
+    
+    # Обработчик диалога
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start),
+            MessageHandler(filters.PHOTO, photo_handler)
+        ],
+        states={
+            UPLOAD_PHOTO: [
+                MessageHandler(filters.PHOTO, photo_handler),
+                CommandHandler('cancel', cancel)
+            ],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    
+    # Добавляем обработчики
+    application.add_handler(conv_handler)
+    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(?!regenerate|new_meme).*$"))
+    application.add_handler(CallbackQueryHandler(regenerate_handler, pattern="^regenerate$"))
+    application.add_handler(CallbackQueryHandler(new_meme_handler, pattern="^new_meme$"))
+    
+    print('🚀 Бот с AI-генерацией мемов запущен...')
+    print('📱 Иди в Telegram и отправь /start')
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
